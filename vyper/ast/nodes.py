@@ -3,6 +3,7 @@ import contextlib
 import copy
 import decimal
 import functools
+import math
 import operator
 import pickle
 import sys
@@ -13,6 +14,7 @@ from vyper.ast.metadata import NodeMetadata
 from vyper.compiler.settings import VYPER_ERROR_CONTEXT_LINES, VYPER_ERROR_LINE_NUMBERS
 from vyper.exceptions import (
     ArgumentException,
+    CompilerPanic,
     InvalidLiteral,
     InvalidOperation,
     OverflowException,
@@ -24,7 +26,14 @@ from vyper.exceptions import (
     VyperException,
     ZeroDivisionException,
 )
-from vyper.utils import MAX_DECIMAL_PLACES, SizeLimits, annotate_source_code, evm_div
+from vyper.utils import (
+    MAX_DECIMAL_PLACES,
+    SizeLimits,
+    annotate_source_code,
+    evm_div,
+    quantize,
+    sha256sum,
+)
 
 NODE_BASE_ATTRIBUTES = (
     "_children",
@@ -53,7 +62,8 @@ def get_node(
     ast_struct: Union[dict, python_ast.AST], parent: Optional["VyperNode"] = None
 ) -> "VyperNode":
     """
-    Convert an AST structure to a vyper AST node.
+    Convert an AST structure to a vyper AST node. Entry point to constructing
+    vyper AST nodes.
 
     This is a recursive call, all child nodes of the input value are also
     converted to Vyper nodes.
@@ -107,7 +117,8 @@ def get_node(
         ast_struct["ast_type"] = "FlagDef"
 
     vy_class = getattr(sys.modules[__name__], ast_struct["ast_type"], None)
-    if not vy_class:
+
+    if vy_class is None:
         if ast_struct["ast_type"] == "Delete":
             _raise_syntax_exc("Deleting is not supported", ast_struct)
         elif ast_struct["ast_type"] in ("ExtSlice", "Slice"):
@@ -130,50 +141,10 @@ def get_node(
             f"enum will be deprecated in a future release, use flag instead. {pretty_printed_node}",
             stacklevel=2,
         )
+
+    node.validate()
+
     return node
-
-
-def compare_nodes(left_node: "VyperNode", right_node: "VyperNode") -> bool:
-    """
-    Compare the represented value(s) of two vyper nodes.
-
-    This method evaluates a sort of "loose equality". It recursively compares the
-    values of each field within two different nodes but does not compare the
-    node_id or any members related to source offsets.
-
-    Arguments
-    ---------
-    left_node : VyperNode
-        First node object to compare.
-    right_node : VyperNode
-        Second node object to compare.
-
-    Returns
-    -------
-    bool
-        True if the given nodes represent the same value(s), False otherwise.
-    """
-    if not isinstance(left_node, type(right_node)):
-        return False
-
-    for field_name in (i for i in left_node.get_fields() if i not in VyperNode.__slots__):
-        left_value = getattr(left_node, field_name, None)
-        right_value = getattr(right_node, field_name, None)
-
-        # compare types instead of isinstance() in case one node class inherits the other
-        if type(left_value) is not type(right_value):
-            return False
-
-        if isinstance(left_value, list):
-            if next((i for i in zip(left_value, right_value) if not compare_nodes(*i)), None):
-                return False
-        elif isinstance(left_value, VyperNode):
-            if not compare_nodes(left_value, right_value):
-                return False
-        elif left_value != right_value:
-            return False
-
-    return True
 
 
 def _to_node(obj, parent):
@@ -183,7 +154,7 @@ def _to_node(obj, parent):
     if isinstance(obj, VyperNode):
         # if object is already a vyper node, make sure the parent is set correctly
         # and fix any missing source offsets
-        obj._parent = parent
+        obj.set_parent(parent)
         for field_name in NODE_SRC_ATTRIBUTES:
             if getattr(obj, field_name) is None:
                 setattr(obj, field_name, getattr(parent, field_name, None))
@@ -313,6 +284,10 @@ class VyperNode:
         if parent is not None:
             parent._children.append(self)
 
+    @property
+    def parent(self):
+        return self._parent
+
     # set parent, can be useful when inserting copied nodes into the AST
     def set_parent(self, parent: "VyperNode"):
         self._parent = parent
@@ -356,23 +331,9 @@ class VyperNode:
         slot_fields = [x for i in cls.__mro__ for x in getattr(i, "__slots__", [])]
         return set(i for i in slot_fields if not i.startswith("_"))
 
-    def __hash__(self):
-        values = [getattr(self, i, None) for i in VyperNode._public_slots]
-        return hash(tuple(values))
-
     def __deepcopy__(self, memo):
         # default implementation of deepcopy is a hotspot
         return pickle.loads(pickle.dumps(self))
-
-    def __eq__(self, other):
-        if not isinstance(other, type(self)):
-            return False
-        if getattr(other, "node_id", None) != getattr(self, "node_id", None):
-            return False
-        for field_name in (i for i in self.get_fields() if i not in VyperNode.__slots__):
-            if getattr(self, field_name, None) != getattr(other, field_name, None):
-                return False
-        return True
 
     def __repr__(self):
         cls = type(self)
@@ -403,7 +364,15 @@ class VyperNode:
 
     @property
     def module_node(self):
+        if isinstance(self, Module):
+            return self
         return self.get_ancestor(Module)
+
+    def get_id_dict(self):
+        source_id = None
+        if self.module_node is not None:
+            source_id = self.module_node.source_id
+        return {"node_id": self.node_id, "source_id": source_id}
 
     @property
     def is_literal_value(self):
@@ -435,6 +404,11 @@ class VyperNode:
             return self._metadata["folded_value"]
         except KeyError:
             raise UnfoldableNode("not foldable", self)
+
+    def reduced(self) -> "ExprNode":
+        if self.has_folded_value:
+            return self.get_folded_value()
+        return self
 
     def _set_folded_value(self, node: "VyperNode") -> None:
         # sanity check this is only called once
@@ -477,8 +451,9 @@ class VyperNode:
             else:
                 ast_dict[key] = _to_dict(value)
 
+        # TODO: add full analysis result, e.g. expr_info
         if "type" in self._metadata:
-            ast_dict["type"] = str(self._metadata["type"])
+            ast_dict["type"] = self._metadata["type"].to_dict()
 
         return ast_dict
 
@@ -647,7 +622,14 @@ class TopLevel(VyperNode):
 
 class Module(TopLevel):
     # metadata
-    __slots__ = ("path", "resolved_path", "source_id")
+    __slots__ = ("path", "resolved_path", "source_id", "is_interface")
+
+    def to_dict(self):
+        return dict(source_sha256sum=self.source_sha256sum, **super().to_dict())
+
+    @property
+    def source_sha256sum(self):
+        return sha256sum(self.full_source_code)
 
     @contextlib.contextmanager
     def namespace(self):
@@ -678,7 +660,6 @@ class DocStr(VyperNode):
     """
 
     __slots__ = ("value",)
-    _translated_fields = {"s": "value"}
 
 
 class arguments(VyperNode):
@@ -759,6 +740,23 @@ class ExprNode(VyperNode):
         super().__init__(*args, **kwargs)
         self._expr_info = None
 
+    def to_dict(self):
+        ret = super().to_dict()
+        if self._expr_info is None:
+            return ret
+
+        reads = [s.to_dict() for s in self._expr_info._reads]
+        reads = [s for s in reads if s]
+        if reads:
+            ret["variable_reads"] = reads
+
+        writes = [s.to_dict() for s in self._expr_info._writes]
+        writes = [s for s in writes if s]
+        if writes:
+            ret["variable_writes"] = writes
+
+        return ret
+
 
 class Constant(ExprNode):
     # inherited class for all simple constant node types
@@ -772,12 +770,6 @@ class Constant(ExprNode):
 class Num(Constant):
     # inherited class for all numeric constant node types
     __slots__ = ()
-    _translated_fields = {"n": "value"}
-
-    @property
-    def n(self):
-        # TODO phase out use of Num.n and remove this
-        return self.value
 
     def validate(self):
         if self.value < SizeLimits.MIN_INT256:
@@ -822,6 +814,7 @@ class Decimal(Num):
         return ast_dict
 
     def validate(self):
+        # note: maybe use self.value == quantize(self.value) for this check
         if self.value.as_tuple().exponent < -MAX_DECIMAL_PLACES:
             raise InvalidLiteral("Vyper supports a maximum of ten decimal points", self)
         if self.value < SizeLimits.MIN_AST_DECIMAL:
@@ -841,13 +834,17 @@ class Hex(Constant):
     """
 
     __slots__ = ()
-    _translated_fields = {"n": "value"}
 
     def validate(self):
         if "_" in self.value:
+            # TODO: revisit this, we should probably allow underscores
             raise InvalidLiteral("Underscores not allowed in hex literals", self)
         if len(self.value) % 2:
             raise InvalidLiteral("Hex notation requires an even number of digits", self)
+
+        if self.value.startswith("0X"):
+            hint = f"Did you mean `0x{self.value[2:]}`?"
+            raise InvalidLiteral("Hex literal begins with 0X!", self, hint=hint)
 
     @property
     def n_nibbles(self):
@@ -873,22 +870,18 @@ class Hex(Constant):
 
 class Str(Constant):
     __slots__ = ()
-    _translated_fields = {"s": "value"}
 
     def validate(self):
         for c in self.value:
-            if ord(c) >= 256:
+            # in utf-8, bytes in the 128 and up range deviate from latin1 and
+            # can be control bytes, allowing multi-byte characters.
+            # reject them here.
+            if ord(c) >= 128:
                 raise InvalidLiteral(f"'{c}' is not an allowed string literal character", self)
-
-    @property
-    def s(self):
-        # TODO phase out use of Str.s and remove this
-        return self.value
 
 
 class Bytes(Constant):
     __slots__ = ()
-    _translated_fields = {"s": "value"}
 
     def __init__(self, parent: Optional["VyperNode"] = None, **kwargs: dict):
         super().__init__(parent, **kwargs)
@@ -902,9 +895,19 @@ class Bytes(Constant):
         ast_dict["value"] = f"0x{self.value.hex()}"
         return ast_dict
 
-    @property
-    def s(self):
-        return self.value
+
+class HexBytes(Constant):
+    __slots__ = ()
+
+    def __init__(self, parent: Optional["VyperNode"] = None, **kwargs: dict):
+        super().__init__(parent, **kwargs)
+        if isinstance(self.value, str):
+            self.value = bytes.fromhex(self.value)
+
+    def to_dict(self):
+        ast_dict = super().to_dict()
+        ast_dict["value"] = f"0x{self.value.hex()}"
+        return ast_dict
 
 
 class List(ExprNode):
@@ -939,6 +942,12 @@ class NameConstant(Constant):
 
 class Ellipsis(Constant):
     __slots__ = ()
+
+    def to_dict(self):
+        ast_dict = super().to_dict()
+        # python ast ellipsis() is not json serializable; use a string
+        ast_dict["value"] = self.node_source_code
+        return ast_dict
 
 
 class Dict(ExprNode):
@@ -1009,9 +1018,15 @@ class Mult(Operator):
         value = left * right
         if isinstance(left, decimal.Decimal):
             # ensure that the result is truncated to MAX_DECIMAL_PLACES
-            return value.quantize(
-                decimal.Decimal(f"{1:0.{MAX_DECIMAL_PLACES}f}"), decimal.ROUND_DOWN
-            )
+            try:
+                # if the intermediate result requires too many decimal places,
+                # decimal will puke - catch the error and raise an
+                # OverflowException
+                return quantize(value)
+            except decimal.InvalidOperation:
+                msg = f"{self._description} requires too many decimal places:"
+                msg += f"\n  {left} * {right} => {value}"
+                raise OverflowException(msg, self) from None
         else:
             return value
 
@@ -1035,10 +1050,15 @@ class Div(Operator):
             # the EVM always truncates toward zero
             value = -(-left / right)
         # ensure that the result is truncated to MAX_DECIMAL_PLACES
-        return value.quantize(decimal.Decimal(f"{1:0.{MAX_DECIMAL_PLACES}f}"), decimal.ROUND_DOWN)
+        try:
+            return quantize(value)
+        except decimal.InvalidOperation:
+            msg = f"{self._description} requires too many decimal places:"
+            msg += f"\n  {left} {self._pretty} {right} => {value}"
+            raise OverflowException(msg, self) from None
 
 
-class FloorDiv(VyperNode):
+class FloorDiv(Operator):
     __slots__ = ()
     _description = "integer division"
     _pretty = "//"
@@ -1080,6 +1100,16 @@ class Pow(Operator):
             raise TypeMismatch("Cannot perform exponentiation on decimal values.", self._parent)
         if right < 0:
             raise InvalidOperation("Cannot calculate a negative power", self._parent)
+        # prevent a compiler hang. we are ok with false positives at this
+        # stage since we are just trying to filter out inputs which can cause
+        # the compiler to hang. the others will get caught during constant
+        # folding or codegen.
+        # l**r > 2**256
+        # r * ln(l) > ln(2 ** 256)
+        # r > ln(2 ** 256) / ln(l)
+        if right > math.log(decimal.Decimal(2**257)) / math.log(decimal.Decimal(left)):
+            raise InvalidLiteral("Out of bounds", self)
+
         return int(left**right)
 
 
@@ -1215,6 +1245,26 @@ class Call(ExprNode):
     __slots__ = ("func", "args", "keywords")
 
     @property
+    def is_extcall(self):
+        return isinstance(self._parent, ExtCall)
+
+    @property
+    def is_staticcall(self):
+        return isinstance(self._parent, StaticCall)
+
+    @property
+    def is_plain_call(self):
+        return not (self.is_extcall or self.is_staticcall)
+
+    @property
+    def kind_str(self):
+        if self.is_extcall:
+            return "extcall"
+        if self.is_staticcall:
+            return "staticcall"
+        raise CompilerPanic("unreachable!")  # pragma: nocover
+
+    @property
     def is_terminus(self):
         # cursed import cycle!
         from vyper.builtins.functions import get_builtin_functions
@@ -1228,6 +1278,31 @@ class Call(ExprNode):
             return False
 
         return builtin_t._is_terminus
+
+
+class ExtCall(ExprNode):
+    __slots__ = ("value",)
+
+    def validate(self):
+        if not isinstance(self.value, Call):
+            # TODO: investigate wrong col_offset for `self.value`
+            raise StructureException(
+                "`extcall` must be followed by a function call",
+                self.value,
+                hint="did you forget parentheses?",
+            )
+
+
+class StaticCall(ExprNode):
+    __slots__ = ("value",)
+
+    def validate(self):
+        if not isinstance(self.value, Call):
+            raise StructureException(
+                "`staticcall` must be followed by a function call",
+                self.value,
+                hint="did you forget parentheses?",
+            )
 
 
 class keyword(VyperNode):
@@ -1264,8 +1339,8 @@ class Assign(Stmt):
         super().__init__(*args, **kwargs)
 
 
-class AnnAssign(VyperNode):
-    __slots__ = ("target", "annotation", "value", "simple")
+class AnnAssign(Stmt):
+    __slots__ = ("target", "annotation", "value")
 
 
 class VariableDecl(VyperNode):
@@ -1314,7 +1389,7 @@ class VariableDecl(VyperNode):
             # do the same thing as `validate_call_args`
             # (can't be imported due to cyclic dependency)
             if len(annotation.args) != 1:
-                raise ArgumentException("Invalid number of arguments to `{call_name}`:", self)
+                raise ArgumentException(f"Invalid number of arguments to `{call_name}`:", self)
 
         # the annotation is a "function" call, e.g.
         # `foo: public(constant(uint256))`
@@ -1381,6 +1456,13 @@ class Pass(Stmt):
 
 class _ImportStmt(Stmt):
     __slots__ = ("name", "alias")
+
+    def to_dict(self):
+        ret = super().to_dict()
+        if (import_info := self._metadata.get("import_info")) is not None:
+            ret["import_info"] = import_info.to_dict()
+
+        return ret
 
     def __init__(self, *args, **kwargs):
         if len(kwargs["names"]) > 1:

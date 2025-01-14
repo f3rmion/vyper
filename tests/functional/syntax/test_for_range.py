@@ -368,14 +368,14 @@ def foo():
     """
 @external
 def foo():
-    x: int128 = 5
+    x: int128 = 4
     for i: int128 in range(x, bound=4):
         pass
     """,
     """
 @external
 def foo():
-    x: int128 = 5
+    x: int128 = 4
     for i: int128 in range(0, x, bound=4):
         pass
     """,
@@ -386,7 +386,7 @@ foos: Foo[3]
 @external
 def kick_foos():
     for foo: Foo in self.foos:
-        foo.kick()
+        extcall foo.kick()
     """,
 ]
 

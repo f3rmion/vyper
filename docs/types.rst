@@ -132,7 +132,7 @@ Shifting is only available for 256-bit wide types. That is, ``x`` must be ``int2
    While at runtime shifts are unchecked (that is, they can be for any number of bits), to prevent common mistakes, the compiler is stricter at compile-time and will prevent out of bounds shifts. For instance, at runtime, ``1 << 257`` will evaluate to ``0``, while that expression at compile-time will raise an ``OverflowException``.
 
 .. note::
-   Integer division has different rounding semantics than Python for negative numbers: Vyper rounds towards zero, while Python rounds towards negative infinity. For example, ``-1 // 2` will return ``-1`` in Python, but ``0`` in Vyper.
+   Integer division has different rounding semantics than Python for negative numbers: Vyper rounds towards zero, while Python rounds towards negative infinity. For example, ``-1 // 2`` will return ``-1`` in Python, but ``0`` in Vyper. This preserves the spirit (but not the text!) of the reasoning for Python's round-towards-negative-infinity behavior, which is that the behavior of ``//`` combined with the behavior of ``%`` preserves the following identity no matter if the quantities are negative or non-negative: ``(x // y) * y + (x % y) == x``.
 
 .. index:: ! uint, ! uintN, ! unsigned integer
 
@@ -230,7 +230,8 @@ Decimals
 
 **Keyword:** ``decimal``
 
-A decimal is a type to store a decimal fixed point value.
+A decimal is a type to store a decimal fixed point value. As of v0.4.0, decimals must be enabled with the CLI flag ``--enable-decimals``.
+
 
 Values
 ******
@@ -239,7 +240,7 @@ A value with a precision of 10 decimal places between -1870722095783555735300716
 
 In order for a literal to be interpreted as ``decimal`` it must include a decimal point.
 
-The ABI type (for computing method identifiers) of ``decimal`` is ``fixed168x10``.
+The ABI type (for computing method identifiers) of ``decimal`` is ``int168``.
 
 Operators
 *********
@@ -358,11 +359,12 @@ A byte array with a max size.
 The syntax being ``Bytes[maxLen]``, where ``maxLen`` is an integer which denotes the maximum number of bytes.
 On the ABI level the Fixed-size bytes array is annotated as ``bytes``.
 
-Bytes literals may be given as bytes strings.
+Bytes literals may be given as bytes strings or as hex strings.
 
 .. code-block:: vyper
 
     bytes_string: Bytes[100] = b"\x01"
+    bytes_string: Bytes[100] = x"01"
 
 .. index:: !string
 
@@ -562,7 +564,7 @@ Dynamic arrays represent bounded arrays whose length can be modified at runtime,
 
     .. code-block:: vyper
 
-        for item in self.my_array:
+        for item: uint256 in self.my_array:
             self.my_array[0] = item
 
 In the ABI, they are represented as ``_Type[]``. For instance, ``DynArray[int128, 3]`` gets represented as ``int128[]``, and ``DynArray[DynArray[int128, 3], 3]`` gets represented as ``int128[][]``.

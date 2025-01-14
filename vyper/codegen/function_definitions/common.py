@@ -28,6 +28,7 @@ class _FuncIRInfo:
     func_t: ContractFunctionT
     gas_estimate: Optional[int] = None
     frame_info: Optional[FrameInfo] = None
+    func_ir: Optional["InternalFuncIR"] = None
 
     @property
     def visibility(self):
@@ -55,6 +56,10 @@ class _FuncIRInfo:
             assert frame_info == self.frame_info
         else:
             self.frame_info = frame_info
+
+    def set_func_ir(self, func_ir: "InternalFuncIR") -> None:
+        assert self.func_t.is_internal or self.func_t.is_deploy
+        self.func_ir = func_ir
 
     @property
     # common entry point for external function with kwargs
@@ -150,14 +155,14 @@ def get_nonreentrant_lock(func_t):
     LOAD, STORE = "sload", "sstore"
     if version_check(begin="cancun"):
         LOAD, STORE = "tload", "tstore"
-
-    if version_check(begin="berlin"):
-        # any nonzero values would work here (see pricing as of net gas
+        # for tload/tstore we don't need to care about net gas metering,
+        # choose small constants (e.g. 0 can be replaced by PUSH0)
+        final_value, temp_value = 0, 1
+    else:
+        # any nonzero values can work here (see pricing as of net gas
         # metering); these values are chosen so that downgrading to the
         # 0,1 scheme (if it is somehow necessary) is safe.
         final_value, temp_value = 3, 2
-    else:
-        final_value, temp_value = 0, 1
 
     check_notset = ["assert", ["ne", temp_value, [LOAD, nkey]]]
 
